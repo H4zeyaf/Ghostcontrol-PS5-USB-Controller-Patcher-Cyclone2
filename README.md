@@ -41,6 +41,7 @@ https://github.com/user-attachments/assets/6583b1c2-3d3d-4f2e-9e79-689121fea4a3
 |-----------|------|---------|--------|
 | 8BitDo Ultimate 2 | Nintendo Switch Pro | 057e:2009 | ✅ Working |
 | 8BitDo Ultimate 2 | Native | 2dc8:310b | Untested |
+| GameSir Cyclone 2 | XInput / Xbox 360 | 3537:100b | ✅ Added Support |
 
 See `othercontrollersGuide.md` for adding new controllers.
 
@@ -88,8 +89,9 @@ See `ProControllerResearch.md` for the full research documentation on the USB HI
 | `gc_main.c` | Main payload — VDA, VDI, USB HID thread, button parsing |
 | `shellui_pad.c` | ShellUI PT_ATTACH helper for force_bind via MBus |
 | `shellui_pad.h` | Header for shellui_pad |
+| `controller_xbox360.c` | Driver for Xbox 360 / XInput wireless controllers (GameSir Cyclone 2, etc.) |
+| `controller_xbox360.h` | Header for Xbox 360 driver |
 | `Makefile` | Build system |
-| `ghost-control-ps5.elf` | Pre-compiled payload (deploy directly) |
 | `ProControllerResearch.md` | Full USB protocol research for Nintendo Switch Pro Controller |
 | `othercontrollersGuide.md` | Guide for adding other USB HID controllers |
 

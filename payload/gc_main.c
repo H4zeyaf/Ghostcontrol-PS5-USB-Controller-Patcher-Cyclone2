@@ -43,6 +43,7 @@
 #include "usb_helpers.h"
 #include "controller_nintendo.h"
 #include "controller_xbox.h"
+#include "controller_xbox360.h"
 
 /* ── Logging ──────────────────────────────────────────────────────────── */
 #define LOG_DIR  "/data/ghostpad"
@@ -101,6 +102,9 @@ typedef struct {
     char             dev_path[32];  /* ugen path claimed by this slot */
     uint16_t         vid, pid;
     volatile uint32_t inject_count;
+    volatile int     has_data;
+    ScePadData       last_pad;
+    pthread_mutex_t  pad_lock;
 } ctrl_slot_t;
 
 static ctrl_slot_t     g_slots[MAX_SLOTS];
@@ -142,7 +146,7 @@ static uint64_t klog_dequeue_ms(int ms) {
 
 /* ── Notification ─────────────────────────────────────────────────────── */
 typedef struct { char _unk[45]; char message[3075]; } NotifyRequest;
-static void notify(const char *fmt, ...) {
+void notify(const char *fmt, ...) {
     NotifyRequest req; va_list ap;
     memset(&req, 0, sizeof(req));
     va_start(ap, fmt); vsnprintf(req.message, sizeof(req.message), fmt, ap); va_end(ap);
@@ -205,16 +209,48 @@ static void *klog_capture_thread(void *arg) {
     close(fd); return NULL;
 }
 
-/* ── VDI injection ────────────────────────────────────────────────────── */
-static void inject_pad(int slot, const ScePadData *pad) {
-    int32_t h = g_slots[slot].handle;
-    if (h < 0 || !g_slots[slot].vdi_ready) return;
-    int vr = scePadVirtualDeviceInsertData(h, pad);
-    uint32_t n = ++g_slots[slot].inject_count;
-    if ((n % 600) == 0)
-        gp_log("slot[%d] VDI #%u ret=0x%08x\n", slot, n, (uint32_t)vr);
-    static int vdi_err_logged = 0;
-    if (vr != 0 && !vdi_err_logged) { gp_log("VDI error 0x%08x\n",(uint32_t)vr); vdi_err_logged=1; }
+/* ── VDI continuous injection thread ──────────────────────────────────── */
+/* Runs at 125Hz (every 8ms) — matches Xbox 360 native report rate and PS5
+ * virtual device frame pacing. Keeps scePadVirtualDeviceInsertData continuously
+ * fed so games and ShellCore hold-repeat work smoothly without buffer congestion. */
+static void *vdi_inject_thread(void *arg) {
+    (void)arg;
+    gp_log("VDI continuous injector thread started (125Hz)\n");
+
+    while (1) {
+        for (int s = 0; s < MAX_SLOTS; s++) {
+            if (!g_slots[s].vdi_ready || g_slots[s].handle < 0 || !g_slots[s].has_data)
+                continue;
+
+            pthread_mutex_lock(&g_slots[s].pad_lock);
+            if (!g_slots[s].vdi_ready || g_slots[s].handle < 0 || !g_slots[s].has_data) {
+                pthread_mutex_unlock(&g_slots[s].pad_lock);
+                continue;
+            }
+            int32_t h = g_slots[s].handle;
+            ScePadData pad = g_slots[s].last_pad;
+            pthread_mutex_unlock(&g_slots[s].pad_lock);
+
+            pad.connected = 1;
+            pad.quat.w    = 1.0f;
+            pad.timestamp = 0;
+            pad.count     = 0;
+
+            int vr = scePadVirtualDeviceInsertData(h, &pad);
+            uint32_t n = ++g_slots[s].inject_count;
+            if ((n % 1250) == 0) {
+                gp_log("slot[%d] VDI #%u ret=0x%08x btn=0x%08x lx=%u ly=%u\n",
+                       s, n, (uint32_t)vr, pad.buttons, pad.leftStick.x, pad.leftStick.y);
+            }
+            static int vdi_err_logged[MAX_SLOTS] = {0};
+            if (vr != 0 && !vdi_err_logged[s]) {
+                gp_log("slot[%d] VDI error 0x%08x\n", s, (uint32_t)vr);
+                vdi_err_logged[s] = 1;
+            }
+        }
+        usleep(8000); /* 125 Hz (every 8ms) */
+    }
+    return NULL;
 }
 
 /* ── ugen detection ───────────────────────────────────────────────────── */
@@ -224,6 +260,8 @@ static void inject_pad(int slot, const ScePadData *pad) {
 #define PID_SWITCH  0x2009u
 #define VID_XBOX    0x045eu
 #define PID_XBOX    0x02eau
+#define VID_GAMESIR 0x3537u
+#define PID_GAMESIR 0x100bu
 
 static const char *UGEN_PATHS[] = {
     "/dev/ugen2.2","/dev/ugen2.3","/dev/ugen2.4","/dev/ugen2.5",
@@ -241,6 +279,89 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
     int fd = open(path, O_RDWR|O_NONBLOCK);
     if (fd < 0) return 0;
 
+    uint16_t dev_vid = 0, dev_pid = 0;
+
+    /* ── Try VID/PID detection BEFORE USB_FS_INIT ────────────────────── */
+    /* USB_FS_INIT puts the device into bulk/interrupt transfer mode,
+     * which may block descriptor ioctls. Try them first. */
+
+    /* Method 1: USB_GET_DEVICE_DESC (raw USB descriptor, most reliable) */
+    {
+        struct usb_device_descriptor ddesc;
+        memset(&ddesc, 0, sizeof(ddesc));
+        if (ioctl(fd, USB_GET_DEVICE_DESC, &ddesc) == 0) {
+            dev_vid = UGETW(ddesc.idVendor);
+            dev_pid = UGETW(ddesc.idProduct);
+            gp_log("probe: %s M1(GET_DEVICE_DESC) VID=0x%04x PID=0x%04x\n", path, dev_vid, dev_pid);
+        }
+    }
+
+    /* Method 2: USB_DEVICEINFO (ioctl #4, IOWR) */
+    if (dev_vid == 0) {
+        struct usb_device_info di;
+        memset(&di, 0, sizeof(di));
+        if (ioctl(fd, USB_DEVICEINFO, &di) == 0 && di.udi_vendorNo != 0) {
+            dev_vid = di.udi_vendorNo;
+            dev_pid = di.udi_productNo;
+            gp_log("probe: %s M2(DEVICEINFO) VID=0x%04x PID=0x%04x\n", path, dev_vid, dev_pid);
+        }
+    }
+
+    /* Method 3: USB_GET_DEVICEINFO (ioctl #112, IOR) */
+    if (dev_vid == 0) {
+        struct usb_device_info di;
+        memset(&di, 0, sizeof(di));
+        if (ioctl(fd, USB_GET_DEVICEINFO, &di) == 0 && di.udi_vendorNo != 0) {
+            dev_vid = di.udi_vendorNo;
+            dev_pid = di.udi_productNo;
+            gp_log("probe: %s M3(GET_DEVICEINFO) VID=0x%04x PID=0x%04x\n", path, dev_vid, dev_pid);
+        }
+    }
+
+    /* Method 4: USB_DO_REQUEST — raw GET_DESCRIPTOR control transfer */
+    if (dev_vid == 0) {
+        uint8_t desc_buf[18];
+        struct usb_ctl_request ucr;
+        memset(&ucr, 0, sizeof(ucr));
+        memset(desc_buf, 0, sizeof(desc_buf));
+        ucr.ucr_data = desc_buf;
+        ucr.ucr_flags = 0;
+        ucr.ucr_request.bmRequestType = 0x80; /* Device-to-host, standard, device */
+        ucr.ucr_request.bRequest = 6;         /* GET_DESCRIPTOR */
+        USETW(ucr.ucr_request.wValue, 0x0100); /* Descriptor type 1 (DEVICE), index 0 */
+        USETW(ucr.ucr_request.wIndex, 0);
+        USETW(ucr.ucr_request.wLength, 18);
+        if (ioctl(fd, USB_DO_REQUEST, &ucr) == 0 && ucr.ucr_actlen >= 10) {
+            dev_vid = (uint16_t)(desc_buf[8] | (desc_buf[9] << 8));
+            dev_pid = (uint16_t)(desc_buf[10] | (desc_buf[11] << 8));
+            gp_log("probe: %s M4(DO_REQUEST) VID=0x%04x PID=0x%04x\n", path, dev_vid, dev_pid);
+        }
+    }
+
+    /* ── Match by VID/PID if we got one ─────────────────────────────── */
+    if (dev_vid != 0) {
+        if (dev_vid == VID_GAMESIR && dev_pid == PID_GAMESIR) {
+            gp_log("probe: %s → GameSir Cyclone 2\n", path);
+            *out_vid = VID_GAMESIR; *out_pid = PID_GAMESIR;
+            close(fd); return 1;
+        }
+        if (dev_vid == VID_SWITCH && dev_pid == PID_SWITCH) {
+            gp_log("probe: %s → Nintendo (by VID/PID)\n", path);
+            *out_vid = VID_SWITCH; *out_pid = PID_SWITCH;
+            close(fd); return 1;
+        }
+        if ((dev_vid == VID_XBOX && dev_pid == PID_XBOX) ||
+            (dev_vid == 0x057eu)) {
+            /* 8BitDo in Switch mode also uses VID 0x057E */
+            gp_log("probe: %s → Xbox/Nintendo (by VID/PID)\n", path);
+            *out_vid = dev_vid; *out_pid = dev_pid;
+            close(fd); return 1;
+        }
+        /* Unknown VID/PID — log and continue to endpoint probe */
+        gp_log("probe: %s VID=0x%04x PID=0x%04x — unknown\n", path, dev_vid, dev_pid);
+    }
+
+    /* ── Endpoint-based fallback (needs USB_FS_INIT) ────────────────── */
     struct usb_fs_endpoint ep;
     struct usb_fs_init ini;
     struct usb_fs_uninit u;
@@ -252,15 +373,14 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
     ii=1;     ioctl(fd,USB_IFACE_DRIVER_DETACH,&ii);
     ii=2;     ioctl(fd,USB_IFACE_DRIVER_DETACH,&ii);
 
+    int found = 0;
     struct usb_fs_open po;
     memset(&po,0,sizeof(po)); po.ep_index=0; po.max_bufsize=64; po.max_frames=1;
-
-    int found = 0;
 
     /* Nintendo: ep=0x81, maxpkt=64 */
     po.ep_no=0x81;
     if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length==64) {
-        gp_log("probe: %s ep=0x81 mpkt=%u → Nintendo\n", path,(unsigned)po.max_packet_length);
+        gp_log("probe: %s ep=0x81 mpkt=%u → Nintendo (endpoint)\n", path,(unsigned)po.max_packet_length);
         struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
         *out_vid=VID_SWITCH; *out_pid=PID_SWITCH;
         found = 1;
@@ -271,7 +391,7 @@ static int probe_one_path(const char *path, uint16_t *out_vid, uint16_t *out_pid
     memset(&po,0,sizeof(po)); po.ep_index=0; po.max_bufsize=64; po.max_frames=1;
     po.ep_no=0x82;
     if (ioctl(fd,USB_FS_OPEN,&po)==0 && po.max_packet_length>0 && po.max_packet_length<=64) {
-        gp_log("probe: %s ep=0x82 mpkt=%u → Xbox One\n", path,(unsigned)po.max_packet_length);
+        gp_log("probe: %s ep=0x82 mpkt=%u → Xbox One (endpoint)\n", path,(unsigned)po.max_packet_length);
         struct usb_fs_close pc; memset(&pc,0,sizeof(pc)); pc.ep_index=0; ioctl(fd,USB_FS_CLOSE,&pc);
         *out_vid=VID_XBOX; *out_pid=PID_XBOX;
         found = 1;
@@ -395,6 +515,63 @@ static void *usb_hid_thread(void *arg) {
         goto main_loop;
     }
 
+    /* ── GameSir Cyclone 2 (XInput): Xbox One-style init ──────────────── */
+    /* The GameSir in XInput mode uses a vendor-specific interface (not HID).
+     * Must DETACH before FS_INIT — same pattern as Xbox One. */
+    if (pid == PID_GAMESIR) {
+        fd = open(dev_path, O_RDWR);
+        if (fd < 0) { gp_log("slot[%d] GameSir open fail errno=%d\n", slot, errno); goto exit_slot; }
+
+        /* Detach ALL interfaces first (vendor-specific + HID) */
+        { int ii; for(ii=0;ii<4;ii++){int i2=ii; ioctl(fd,USB_IFACE_DRIVER_DETACH,&i2);} }
+        usleep(120000); /* hub settle — critical for PS5 USB stack */
+
+        memset(eps,0,sizeof(eps)); memset(&init,0,sizeof(init));
+        init.pEndpoints=eps; init.ep_index_max=4;
+        if (ioctl(fd,USB_FS_INIT,&init)!=0){
+            gp_log("slot[%d] GameSir FS_INIT fail errno=%d\n",slot,errno);
+            close(fd); goto exit_slot;
+        }
+
+        /* Try IN endpoints: 0x81 first, then 0x82, 0x83 */
+        int in_ep = 0;
+        int ep_candidates[] = {0x81, 0x82, 0x83};
+        for (int e = 0; e < 3; e++) {
+            memset(&fs_open,0,sizeof(fs_open));
+            fs_open.ep_index=0; fs_open.ep_no=ep_candidates[e];
+            fs_open.max_bufsize=64; fs_open.max_frames=1;
+            if (ioctl(fd,USB_FS_OPEN,&fs_open)==0) {
+                in_ep = ep_candidates[e];
+                gp_log("slot[%d] GameSir IN ep=0x%02x ok maxpkt=%u\n",
+                       slot, in_ep, (unsigned)fs_open.max_packet_length);
+                break;
+            }
+            gp_log("slot[%d] GameSir IN ep=0x%02x fail errno=%d\n",slot,ep_candidates[e],errno);
+        }
+        if (in_ep == 0) {
+            notify("Ghostcontrol: GameSir IN endpoint open failed");
+            goto uninit_exit;
+        }
+
+        buffers[0]=buf; lengths[0]=64;
+        eps[0].ppBuffer=buffers; eps[0].pLength=lengths; eps[0].nFrames=1;
+        eps[0].timeout=0; /* Infinite timeout: wait for incoming packet without aborting endpoint */
+        eps[0].flags=USB_FS_FLAG_SINGLE_SHORT_OK|USB_FS_FLAG_MULTI_SHORT_OK;
+
+        /* Try OUT endpoints: 0x01, 0x02 */
+        memset(&fs_open,0,sizeof(fs_open));
+        fs_open.ep_index=1; fs_open.ep_no=0x02; fs_open.max_bufsize=64; fs_open.max_frames=1;
+        out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        if (!out_opened) {
+            memset(&fs_open,0,sizeof(fs_open));
+            fs_open.ep_index=1; fs_open.ep_no=0x01; fs_open.max_bufsize=64; fs_open.max_frames=1;
+            out_opened = (ioctl(fd,USB_FS_OPEN,&fs_open)==0) ? 1 : 0;
+        }
+        gp_log("slot[%d] GameSir OUT opened=%d\n", slot, out_opened);
+
+        goto main_loop;
+    }
+
     /* ── Nintendo: two-pass ────────────────────────────────────────────── */
     fd = open(dev_path, O_RDWR);
     if (fd < 0) { gp_log("slot[%d] open fail errno=%d\n", slot, errno); goto exit_slot; }
@@ -464,7 +641,7 @@ static void *usb_hid_thread(void *arg) {
     }
 
 main_loop: ;
-    int hs_state = (pid==PID_XBOX) ? HS_STREAMING : HS_WAIT_81_01;
+    int hs_state = (pid==PID_XBOX || pid==PID_GAMESIR) ? HS_STREAMING : HS_WAIT_81_01;
     uint8_t nintendo_seq = 1;
 
     while (1) {
@@ -486,14 +663,20 @@ main_loop: ;
             continue;
         }
 
-        int ok=0, cerr=0, cw=0;
-        for(cw=0;cw<60;cw++){
+        int ok=0, cerr=0;
+        while (1) {
             memset(&complete,0,sizeof(complete)); complete.ep_index=0;
-            if(ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
+            if (ioctl(fd,USB_FS_COMPLETE,&complete)==0){ok=1;break;}
             cerr=errno;
-            if(cerr==ENXIO||cerr==ENOTTY){gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);goto reinit;}
-            if(cerr!=EBUSY) break;
-            usleep(500);
+            if (cerr==ENXIO||cerr==ENOTTY||cerr==EBADF){
+                gp_log("slot[%d] COMPLETE errno=%d — gone\n",slot,cerr);
+                goto reinit;
+            }
+            if (cerr!=EBUSY) {
+                gp_log("slot[%d] COMPLETE errno=%d\n",slot,cerr);
+                break;
+            }
+            usleep(1000);
         }
         if(!ok){
             memset(&stop,0,sizeof(stop)); stop.ep_index=0; ioctl(fd,USB_FS_STOP,&stop);
@@ -508,15 +691,14 @@ main_loop: ;
 
         if (pid == PID_XBOX) {
             injected = xbox_handle_packet(fd, eps, buf, len, &pad);
+        } else if (pid == PID_GAMESIR) {
+            injected = xbox360_handle_packet(fd, eps, buf, len, &pad);
         } else {
             injected = nintendo_handle_packet(fd, eps, buf, len, &hs_state, &nintendo_seq, &pad);
         }
 
         if (injected > 0) {
-            if (!usb_ready_notified) {
-                notify("Ghostcontrol: slot[%d] streaming — controller active", slot);
-                usb_ready_notified = 1;
-            }
+            usb_ready_notified = 1;
             /* First real button press confirms the assignment — release the gate
              * so the manager can start the next controller's dialog. */
             if (!g_slots[slot].confirmed && pad.buttons != 0) {
@@ -524,7 +706,10 @@ main_loop: ;
                 if (g_assign_slot == slot) g_assign_slot = -1;
                 gp_log("slot[%d] assignment confirmed (button press)\n", slot);
             }
-            inject_pad(slot, &pad);
+            pthread_mutex_lock(&g_slots[slot].pad_lock);
+            g_slots[slot].last_pad = pad;
+            g_slots[slot].has_data = 1;
+            pthread_mutex_unlock(&g_slots[slot].pad_lock);
         }
     }
 
@@ -542,10 +727,18 @@ uninit_exit:
 
 exit_slot:
     gp_log("slot[%d] USB thread exiting — freeing slot\n", slot);
-    scePadVirtualDeviceDeleteDevice(g_slots[slot].handle);
-    pthread_mutex_lock(&g_slot_lock);
+    pthread_mutex_lock(&g_slots[slot].pad_lock);
+    int32_t old_h = g_slots[slot].handle;
     g_slots[slot].handle    = -1;
     g_slots[slot].vdi_ready = 0;
+    g_slots[slot].has_data  = 0;
+    pthread_mutex_unlock(&g_slots[slot].pad_lock);
+
+    if (old_h >= 0) {
+        scePadVirtualDeviceDeleteDevice(old_h);
+    }
+
+    pthread_mutex_lock(&g_slot_lock);
     g_slots[slot].usb_active= 0;
     g_slots[slot].dev_path[0] = '\0';
     pthread_mutex_unlock(&g_slot_lock);
@@ -598,9 +791,10 @@ static void *controller_manager_thread(void *arg) {
             }
 
             const char *name =
-                (vid==VID_SWITCH && pid==PID_SWITCH) ? "Nintendo Switch Pro / 8BitDo" :
-                (vid==VID_NATIVE && pid==PID_NATIVE) ? "8BitDo Native" :
-                (vid==VID_XBOX   && pid==PID_XBOX)   ? "Xbox One S" : "Unknown";
+                (vid==VID_SWITCH  && pid==PID_SWITCH)  ? "Nintendo Switch Pro / 8BitDo" :
+                (vid==VID_NATIVE  && pid==PID_NATIVE)  ? "8BitDo Native" :
+                (vid==VID_XBOX    && pid==PID_XBOX)    ? "Xbox One S" :
+                (vid==VID_GAMESIR && pid==PID_GAMESIR) ? "GameSir Cyclone 2" : "Unknown";
 
             gp_log("manager: %s at %s → slot[%d]\n", name, path, slot);
             notify("Ghostcontrol: %s detected — assign user on screen", name);
@@ -629,11 +823,21 @@ static void *controller_manager_thread(void *arg) {
                 continue;
             }
 
+            pthread_mutex_lock(&g_slots[slot].pad_lock);
             pthread_mutex_lock(&g_slot_lock);
-            g_slots[slot].handle      = handle;
-            g_slots[slot].vdi_ready   = 1;
+            g_slots[slot].handle       = handle;
+            g_slots[slot].vdi_ready    = 1;
             g_slots[slot].inject_count = 0;
+            memset(&g_slots[slot].last_pad, 0, sizeof(ScePadData));
+            g_slots[slot].last_pad.leftStick.x  = 128;
+            g_slots[slot].last_pad.leftStick.y  = 128;
+            g_slots[slot].last_pad.rightStick.x = 128;
+            g_slots[slot].last_pad.rightStick.y = 128;
+            g_slots[slot].last_pad.quat.w       = 1.0f;
+            g_slots[slot].last_pad.connected    = 1;
+            g_slots[slot].has_data     = 1;
             pthread_mutex_unlock(&g_slot_lock);
+            pthread_mutex_unlock(&g_slots[slot].pad_lock);
 
             /* Launch USB reader thread */
             usb_thread_arg_t *targ = malloc(sizeof(*targ));
@@ -731,7 +935,9 @@ int main(void) {
         g_slots[s].vdi_ready  = 0;
         g_slots[s].usb_active = 0;
         g_slots[s].confirmed  = 0;
+        g_slots[s].has_data   = 0;
         g_slots[s].dev_path[0]= '\0';
+        pthread_mutex_init(&g_slots[s].pad_lock, NULL);
     }
     g_assign_slot = -1;
 
@@ -766,6 +972,13 @@ int main(void) {
     if (pthread_create(&mgr_tid, NULL, controller_manager_thread, NULL)==0) {
         pthread_detach(mgr_tid);
         gp_log("Manager thread started\n");
+    }
+
+    /* Start continuous VDI injection thread (250Hz) */
+    pthread_t inj_tid;
+    if (pthread_create(&inj_tid, NULL, vdi_inject_thread, NULL)==0) {
+        pthread_detach(inj_tid);
+        gp_log("VDI inject thread started\n");
     }
 
     /* Keep-alive */

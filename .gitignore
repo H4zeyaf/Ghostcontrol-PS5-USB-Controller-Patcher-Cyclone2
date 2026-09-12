@@ -1,0 +1,15 @@
+# Compiled binaries and payloads
+*.elf
+*.bin
+*.o
+*.a
+*.so
+
+# PS5 Payload SDK
+ps5-payload-sdk/
+
+# OS and Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
